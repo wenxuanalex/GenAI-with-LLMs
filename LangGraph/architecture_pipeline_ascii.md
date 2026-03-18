@@ -6,6 +6,8 @@ Two proposal-level upgrades are explicitly included in the current design:
   - The planner breaks multi-period / cross-company questions into 2 to 3 targeted sub-queries before retrieval.
 - `Refined Critic` = the `Guardrail` upgrade
   - The critic can return `insufficient_data` so the agent exits safely instead of looping on unanswerable questions.
+- `Drift Detection + Auto-Ingestion`
+  - When the critic cannot find the needed filing data, the agent can log the miss, scrape the missing filing from EDGAR, ingest it, and retry retrieval.
 
 ```text
 +----------------------------------------------------------------------------------+
@@ -63,12 +65,23 @@ Two proposal-level upgrades are explicitly included in the current design:
 | Critic [Agent]                                                                   |
 |   Refined Critic ("Guardrail" upgrade)                                           |
 |   - decides whether the draft looks good, fixable, or unsupported                |
-|   - can safely stop when the filing does not contain the answer                  |
+|   - can safely stop, or trigger a fresh EDGAR ingest when the corpus is stale    |
 |                      |                                                           |
-|                      v                                                           |
+|        +-------------+------------------------------+                            |
+|        |                                            |                            |
+|        v                                            v                            |
 | Repair [Agent]                                                                   |
 |   - fixes the draft when the problem looks fixable                               |
 |   - can ask for another retrieval pass if better evidence is needed              |
+|                                                                                  |
+| Drift Detector [Agent]                                                           |
+|   - logs repeated corpus misses by ticker / year / form                          |
+|   - decides when the missing filing should be fetched                            |
+|      |                                                                           |
+|      v                                                                           |
+| EDGAR Scrape + Ingest [Agent + SEC Data Prep]                                    |
+|   - downloads the missing filing from SEC EDGAR                                  |
+|   - chunks it, upserts it into ChromaDB, rebuilds BM25, then retries retrieval   |
 +----------------------------------------------------------------------------------+
                                          |
                                          v
@@ -77,7 +90,8 @@ Two proposal-level upgrades are explicitly included in the current design:
 +----------------------------------------------------------------------------------+
 | Simple RAG | Advanced RAG | Agentic RAG                                          |
 | -> compare outputs from the different pipelines                                  |
-| -> use an LLM judge to score answer quality                                      |
+| -> score against gold QA answers / evidence                                      |
+| -> optionally add an LLM judge for softer answer-quality checks                  |
 | -> produce the final metrics table                                               |
 +----------------------------------------------------------------------------------+
 ```
@@ -93,13 +107,15 @@ Two proposal-level upgrades are explicitly included in the current design:
   - Owns indexing, hybrid retrieval, and reranking
 
 - `Agent`
-  - Owns planning, retrieval control flow, answer generation, critique, and repair
+  - Owns planning, retrieval control flow, answer generation, critique, repair, and drift-triggered ingestion
   - Includes `Query Decomposition` as the planning upgrade
   - Includes `Refined Critic` as the safe-stop guardrail
+  - Includes a drift branch that can scrape and ingest missing filings from EDGAR
 
 - `Evaluation`
   - Compares simple, advanced, and agentic pipelines
-  - Uses an LLM judge for correctness and faithfulness
+  - Primarily uses gold QA metrics from the labeled SEC eval set
+  - Can optionally use an LLM judge for correctness and faithfulness
 
 ## Function Cheat Sheet
 
@@ -119,6 +135,8 @@ Two proposal-level upgrades are explicitly included in the current design:
   - `node_critic()`: checks whether the draft is grounded, repairable, or unsupported.
   - `node_repair()`: revises the answer or asks for another retrieval pass.
   - `node_mark_repair_retrieval()`: tags the retrieval as repair-driven to avoid bad loops.
+  - `node_drift_detector()`: logs repeated corpus misses and decides whether to fetch a missing filing.
+  - `node_scrape_and_ingest()`: scrapes from EDGAR, chunks the filing, ingests it into ChromaDB, and refreshes retrieval.
 
 ## Included Proposal Concepts
 
@@ -131,3 +149,8 @@ Two proposal-level upgrades are explicitly included in the current design:
   - Included
   - Implemented in the critic schema and routing
   - Adds `insufficient_data` so the system can stop safely when the filing does not contain the answer
+
+- `Proposal 3: Drift Detection + Auto-Ingestion`
+  - Included in `langgraph_agentic_rag_sec_v3.ipynb`
+  - Implemented as a branch from `critic -> drift_detector -> scrape_and_ingest -> hybrid_retriever`
+  - Lets the system fetch missing SEC filings when repeated misses suggest the corpus is stale

@@ -1,3 +1,14 @@
 .claude/settings.local.json
 sec_rag_team_share/chroma_db/chroma.sqlite3
 .env
+# Chroma DB
+chroma.sqlite3
+chroma/
+
+# Logs
+*.jsonl
+drift_log.jsonl
+
+# Optional
+*.db
+*.sqlite3

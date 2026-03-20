@@ -1,14 +1,28 @@
-.claude/settings.local.json
-sec_rag_team_share/chroma_db/chroma.sqlite3
+# =========================
+# Secrets / local configs
+# =========================
 .env
-# Chroma DB
-chroma.sqlite3
-chroma/
+.claude/settings.local.json
 
-# Logs
+# =========================
+# Logs / runtime outputs
+# =========================
 *.jsonl
+!sec_rag_team_share/sec_data/chunks/*.jsonl
 drift_log.jsonl
+sec_rag_team_share/sec_data/drift_log.jsonl
 
-# Optional
+# =========================
+# Temp / scratch files
+# =========================
+tmp_*
+*.log
+
+# =========================
+# Generic local DB ignores
+# Keep Chroma DB for this project tracked,
+# but ignore other stray local DB files elsewhere
+# =========================
 *.db
 *.sqlite3
+!sec_rag_team_share/chroma_db/chroma.sqlite3

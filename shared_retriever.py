@@ -1,0 +1,578 @@
+"""
+Shared Retrieval Module for SEC Agentic RAG
+=============================================
+Framework-agnostic hybrid retrieval pipeline:
+1. BM25 (sparse lexical search)
+2. Dense embedding search (Chroma vector store)
+3. Reciprocal Rank Fusion (RRF) merge
+4. Adjacent chunk expansion (±1 neighbors within same filing)
+5. CrossEncoder reranking
+
+This module is designed to be used identically across CrewAI, LlamaIndex, and LangGraph.
+"""
+
+import os
+import json
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import chromadb
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
+# Import centralized config
+from config import CONFIG
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_existing_path(path_str: str) -> Path:
+    """Resolve path against direct, cwd-relative, and project-root-relative locations."""
+    p = Path(path_str)
+    if p.exists():
+        return p
+    if not p.is_absolute():
+        cwd_candidate = (Path.cwd() / p).resolve()
+        if cwd_candidate.exists():
+            return cwd_candidate
+        root_candidate = (PROJECT_ROOT / p).resolve()
+        if root_candidate.exists():
+            return root_candidate
+    return p
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Data Structures
+# ────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RetrievedChunk:
+    """Standardized retrieved chunk representation across all frameworks."""
+    doc_name:         str    # e.g., "AAPL_10-K_2024-11-01"
+    company:          str    # e.g., "Apple Inc."
+    ticker:           str    # e.g., "AAPL"
+    form_type:        str    # e.g., "10-K" or "10-Q"
+    filing_year:      int    # e.g., 2024
+    page_num:         int    # chunk index within filing
+    chunk_id:         str    # unique chunk identifier
+    raw_chunk:        str    # original unformatted text
+    contextual_chunk: str    # formatted with metadata headers
+    score:            float  # retrieval score (0.0-1.0)
+    source:           str    # 'bm25' | 'dense' | 'adjacent_expanded' | 'hybrid_reranked'
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for framework-agnostic output."""
+        return {
+            'chunk_id':        self.chunk_id,
+            'text':            self.contextual_chunk,
+            'raw_text':        self.raw_chunk,
+            'score':           self.score,
+            'source':          self.source,
+            'metadata': {
+                'doc_name':    self.doc_name,
+                'company':     self.company,
+                'ticker':      self.ticker,
+                'form_type':   self.form_type,
+                'filing_year': self.filing_year,
+                'page_num':    self.page_num,
+            }
+        }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global Model Instances (loaded once at module import)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _load_models():
+    """Load dense embedding and reranker models."""
+    print(f"Loading embedding model: {CONFIG['dense_model_name']}...")
+    dense_model = SentenceTransformer(CONFIG['dense_model_name'])
+    
+    print(f"Loading reranker model: {CONFIG['reranker_model_name']}...")
+    reranker = CrossEncoder(CONFIG['reranker_model_name'])
+    
+    return dense_model, reranker
+
+
+# Load models globally once
+_dense_model, _reranker = _load_models()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CorpusIndex: Unified Retrieval Engine
+# ────────────────────────────────────────────────────────────────────────────
+
+class CorpusIndex:
+    """
+    Corpus index combining BM25 and dense retrieval with RRF fusion and reranking.
+    Implements adjacent chunk expansion for context enrichment.
+    
+    This class is framework-agnostic and designed to work with:
+    - CrewAI: as a tool backend
+    - LlamaIndex: as part of a custom retriever
+    - LangGraph: as a node utility
+    """
+
+    def __init__(
+        self,
+        chunks_jsonl: str,
+        chroma_db_path: str,
+        dense_model_name: str = None,
+        reranker_model_name: str = None,
+    ):
+        """
+        Initialize the corpus index.
+        
+        Args:
+            chunks_jsonl: Path to sec_chunks.jsonl file
+            chroma_db_path: Path to persisted Chroma DB
+            dense_model_name: Override embed model from config
+            reranker_model_name: Override reranker model from config
+        """
+        self.chunks_path = _resolve_existing_path(chunks_jsonl)
+        self.chroma_db_path = _resolve_existing_path(chroma_db_path)
+        
+        if not self.chunks_path.exists():
+            raise FileNotFoundError(f"Chunks JSONL not found: {self.chunks_path}")
+        if not self.chroma_db_path.exists():
+            raise FileNotFoundError(f"Chroma DB not found: {self.chroma_db_path}")
+
+        # Load chunks into DataFrame for rapid O(1) lookup
+        print(f"Loading chunks from {self.chunks_path}...")
+        chunks_data = [json.loads(line) for line in open(self.chunks_path, encoding='utf-8')]
+        raw_df = pd.DataFrame(chunks_data)
+
+        # Normalize to canonical schema.
+        # Supports both:
+        # - {chunk_id, text, metadata}
+        # - sec_rag_team_share schema with metadata at top level
+        if {'chunk_id', 'text', 'metadata'}.issubset(raw_df.columns):
+            self.df = raw_df.copy()
+        else:
+            if 'chunk_id' not in raw_df.columns or 'text' not in raw_df.columns:
+                raise ValueError("Chunks JSONL missing required columns: chunk_id/text")
+
+            def _build_meta(row: pd.Series) -> Dict[str, Any]:
+                return {
+                    'company_name': row.get('company_name', row.get('company', '')),
+                    'ticker': str(row.get('ticker', '')).upper(),
+                    'form_type': str(row.get('form_type', '')).upper(),
+                    'filing_year': int(row.get('filing_year', 0) or 0),
+                    'filing_date': str(row.get('filing_date', ''))[:10],
+                    'chunk_index': int(row.get('chunk_index', 0) or 0),
+                    'section_title': row.get('section_title', ''),
+                }
+
+            self.df = pd.DataFrame({
+                'chunk_id': raw_df['chunk_id'].astype(str),
+                'text': raw_df['text'].fillna('').astype(str),
+                'metadata': raw_df.apply(_build_meta, axis=1),
+            })
+        
+        print(f"Loaded {len(self.df)} chunks")
+
+        # Build BM25 index
+        print("Building BM25 index...")
+        if 'chunk_id_str' not in self.df.columns:
+            self.df['chunk_id_str'] = self.df['chunk_id'].astype(str)
+        if 'bm25_tokens' not in self.df.columns:
+            self.df['bm25_tokens'] = self.df['text'].fillna('').astype(str).str.lower().str.split()
+        self.bm25 = BM25Okapi(
+            self.df['bm25_tokens'].tolist()
+        )
+
+        # Connect to Chroma DB
+        print(f"Connecting to Chroma DB at {self.chroma_db_path}...")
+        self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_db_path))
+        collections = self.chroma_client.list_collections()
+        if collections:
+            self.chroma_collection = self.chroma_client.get_collection(collections[0].name)
+        else:
+            self.chroma_collection = self.chroma_client.get_or_create_collection(name="sec_filings")
+        # Backward-compatible alias used by older notebook code.
+        self.collection = self.chroma_collection
+        print(f"Chroma collection: {self.chroma_collection.count()} vectors")
+
+        # Use global models or accept overrides
+        self.dense_model = _dense_model
+        self.reranker = _reranker
+
+        # Build internal lookup maps for adjacent chunk expansion
+        self._build_lookup_maps()
+        print("CorpusIndex ready.")
+
+    def _build_lookup_maps(self):
+        """Build internal maps for O(1) adjacent chunk lookup."""
+        # Map: chunk_id -> row index
+        self._str_to_row = {str(cid): idx for idx, cid in enumerate(self.df['chunk_id'])}
+        
+        # Map: (ticker, form_type, filing_date) -> chunk_index -> row_index
+        # Allows fast adjacent chunk lookup within same filing
+        self._filing_chunk_lookup = {}
+        for idx, row in self.df.iterrows():
+            meta = row.get('metadata', {})
+            if not isinstance(meta, dict):
+                try:
+                    meta = json.loads(meta) if isinstance(meta, str) else {}
+                except:
+                    meta = {}
+            
+            ticker = meta.get('ticker', '')
+            form_type = meta.get('form_type', '')
+            filing_date = meta.get('filing_date', '')
+            chunk_index = int(meta.get('chunk_index', 0))
+            
+            filing_key = (ticker, form_type, filing_date)
+            if filing_key not in self._filing_chunk_lookup:
+                self._filing_chunk_lookup[filing_key] = {}
+            self._filing_chunk_lookup[filing_key][chunk_index] = idx
+
+    def _chunk_from_row(
+        self, row_idx: int, score: float, source: str
+    ) -> RetrievedChunk:
+        """Construct a RetrievedChunk from a dataframe row."""
+        row = self.df.iloc[row_idx]
+        meta = row.get('metadata', {})
+        if not isinstance(meta, dict):
+            try:
+                meta = json.loads(meta) if isinstance(meta, str) else {}
+            except:
+                meta = {}
+        
+        raw_text = str(row.get('text', ''))
+        contextual_text = self._contextual_from_meta(raw_text, meta)
+        
+        doc_name = f"{meta.get('ticker', '')}_{meta.get('form_type', '')}_{str(meta.get('filing_date', ''))[:10]}"
+        
+        return RetrievedChunk(
+            doc_name=doc_name,
+            company=meta.get('company_name', ''),
+            ticker=meta.get('ticker', ''),
+            form_type=meta.get('form_type', ''),
+            filing_year=int(meta.get('filing_year', 0)),
+            page_num=int(meta.get('chunk_index', 0)),
+            chunk_id=str(row.get('chunk_id', '')),
+            raw_chunk=raw_text,
+            contextual_chunk=contextual_text,
+            score=float(score),
+            source=source,
+        )
+
+    @staticmethod
+    def _contextual_from_meta(text: str, meta: dict) -> str:
+        """Format chunk with metadata headers for context."""
+        return (
+            f"Company: {meta.get('company_name', '')} ({meta.get('ticker', '')})\n"
+            f"Filing: {meta.get('form_type', '')} | Date: {str(meta.get('filing_date', ''))[:10]} "
+            f"| Year: {meta.get('filing_year', '')}\n"
+            f"Section: {meta.get('section_title', '')}\n"
+            f"Content: {text}"
+        )
+
+    def _chroma_where(
+        self, ticker: str = None, filing_year: int = None, form_type: str = None
+    ) -> Optional[Dict]:
+        """Build Chroma metadata filter."""
+        conditions = []
+        if ticker:
+            conditions.append({"ticker": {"$eq": ticker}})
+        if filing_year:
+            conditions.append({"filing_year": {"$eq": filing_year}})
+        if form_type:
+            conditions.append({"form_type": {"$eq": form_type}})
+        
+        if not conditions:
+            return None
+        if len(conditions) == 1:
+            return conditions[0]
+        return {"$and": conditions}
+
+    def _bm25_mask(
+        self, ticker: str = None, filing_year: int = None, form_type: str = None
+    ) -> Optional[np.ndarray]:
+        """Build a BM25 row mask compatible with legacy notebook call sites."""
+        if not ticker and not filing_year and not form_type:
+            return None
+
+        mask = np.ones(len(self.df), dtype=float)
+        for idx, row in self.df.iterrows():
+            meta = row.get('metadata', {})
+            if not isinstance(meta, dict):
+                try:
+                    meta = json.loads(meta) if isinstance(meta, str) else {}
+                except Exception:
+                    meta = {}
+
+            if ticker and str(meta.get('ticker', '')).upper() != str(ticker).upper():
+                mask[idx] = 0.0
+                continue
+            if filing_year and int(meta.get('filing_year', 0) or 0) != int(filing_year):
+                mask[idx] = 0.0
+                continue
+            if form_type and str(meta.get('form_type', '')).upper() != str(form_type).upper():
+                mask[idx] = 0.0
+
+        return mask if mask.sum() > 0 else None
+
+    def bm25_search(
+        self, query: str, top_k: int, mask: Optional[np.ndarray] = None
+    ) -> List[RetrievedChunk]:
+        """BM25 sparse lexical search."""
+        scores = np.array(self.bm25.get_scores(query.lower().split()))
+        if mask is not None:
+            scores = scores * mask
+        top_idx = np.argsort(scores)[::-1]
+        top_idx = [i for i in top_idx if scores[i] > 0][:top_k]
+        return [self._chunk_from_row(i, scores[i], 'bm25') for i in top_idx]
+
+    def dense_search(
+        self,
+        query: str,
+        top_k: int,
+        ticker: str = None,
+        filing_year: int = None,
+        form_type: str = None,
+    ) -> List[RetrievedChunk]:
+        """Dense embedding search via Chroma."""
+        # Use query prefix matching Nomic embedding expectations
+        query_with_prefix = f"search_query: {query}"
+        q_emb = self.dense_model.encode([query_with_prefix], normalize_embeddings=True)[0].tolist()
+        
+        where = self._chroma_where(ticker, filing_year, form_type)
+        results = self.chroma_collection.query(
+            query_embeddings=[q_emb],
+            n_results=top_k,
+            where=where,
+            include=['distances', 'metadatas', 'documents']
+        )
+        
+        chunks = []
+        for doc_id, text, dist, meta in zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['distances'][0],
+            results['metadatas'][0],
+        ):
+            # Find row index from chunk_id
+            row_idx = self._str_to_row.get(doc_id)
+            if row_idx is not None:
+                chunk = self._chunk_from_row(row_idx, 1.0 - float(dist), 'dense')
+                chunks.append(chunk)
+        
+        return chunks
+
+    def _expand_adjacent(
+        self, pool: Dict[str, RetrievedChunk], expand_n: int = 1
+    ) -> List[RetrievedChunk]:
+        """
+        Expand pool with adjacent chunks (±expand_n) within same filing.
+        Returns new chunks not already in pool.
+        """
+        extra = {}
+        existing_ids = set(pool.keys())
+        
+        for chunk in pool.values():
+            # Find filing key
+            ticker = chunk.ticker
+            form_type = chunk.form_type
+            filing_date_str = chunk.doc_name.split('_')[-1]  # e.g., "2024-11-01"
+            
+            filing_key = (ticker, form_type, filing_date_str)
+            if filing_key not in self._filing_chunk_lookup:
+                continue
+            
+            ci_map = self._filing_chunk_lookup[filing_key]
+            base_ci = chunk.page_num
+            
+            # Look for neighbors
+            for delta in range(-expand_n, expand_n + 1):
+                if delta == 0:
+                    continue
+                adj_row_idx = ci_map.get(base_ci + delta)
+                if adj_row_idx is None:
+                    continue
+                adj_id = str(self.df.iloc[adj_row_idx]['chunk_id'])
+                if adj_id in existing_ids or adj_id in extra:
+                    continue
+                extra[adj_id] = self._chunk_from_row(adj_row_idx, 0.0, 'adjacent_expanded')
+        
+        return list(extra.values())
+
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = None,
+        bm25_top_k: int = None,
+        dense_top_k: int = None,
+        rerank_top_k: int = None,
+        embed_model: Any = None,
+        reranker: Any = None,
+        ticker: str = None,
+        filing_year: int = None,
+        form_type: str = None,
+        expand_n: int = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute full hybrid retrieval pipeline:
+        1. BM25 sparse search
+        2. Dense embedding search
+        3. Reciprocal Rank Fusion merge
+        4. Adjacent chunk expansion (contextual enrichment)
+        5. CrossEncoder reranking
+        
+        Returns standardized list of dicts with text, metadata, score, source.
+        """
+        # Use config defaults if not provided
+        bm25_top_k = bm25_top_k or CONFIG['bm25_top_k']
+        dense_top_k = dense_top_k or CONFIG['dense_top_k']
+        rerank_top_k = rerank_top_k or top_k or CONFIG['rerank_top_k']
+        expand_n = expand_n if expand_n is not None else CONFIG.get('adjacent_chunk_expansion_n', 1)
+        
+        legacy_mode = any(
+            x is not None for x in [bm25_top_k, dense_top_k, rerank_top_k, embed_model, reranker]
+        )
+
+        # 1. BM25 Search
+        bm25_results = self.bm25_search(query, top_k=bm25_top_k)
+        
+        # 2. Dense Search
+        dense_results = self.dense_search(
+            query, top_k=dense_top_k, 
+            ticker=ticker, filing_year=filing_year, form_type=form_type
+        )
+        
+        # 3. RRF Merge
+        rrf_k = 60  # Standard RRF smoothing constant
+        def _rrf_score(rank: int, k: int = rrf_k) -> float:
+            return 1.0 / (k + rank)
+        
+        pool: Dict[str, RetrievedChunk] = {}
+        rrf: Dict[str, float] = {}
+        
+        for rank, chunk in enumerate(bm25_results):
+            rrf[chunk.chunk_id] = rrf.get(chunk.chunk_id, 0.0) + _rrf_score(rank)
+            if chunk.chunk_id not in pool:
+                pool[chunk.chunk_id] = chunk
+        
+        for rank, chunk in enumerate(dense_results):
+            rrf[chunk.chunk_id] = rrf.get(chunk.chunk_id, 0.0) + _rrf_score(rank)
+            if chunk.chunk_id not in pool:
+                pool[chunk.chunk_id] = chunk
+        
+        # 4. Adjacent Chunk Expansion
+        for adj_chunk in self._expand_adjacent(pool, expand_n=expand_n):
+            pool[adj_chunk.chunk_id] = adj_chunk
+            rrf[adj_chunk.chunk_id] = 0.0
+        
+        if not pool:
+            return []
+        
+        # 5. CrossEncoder Reranking
+        candidates = [pool[k] for k in sorted(rrf, key=rrf.__getitem__, reverse=True)]
+        scores = self.reranker.predict(
+            [(query, chunk.contextual_chunk) for chunk in candidates],
+            show_progress_bar=False,
+        )
+        
+        for chunk, score in zip(candidates, scores):
+            chunk.score = float(score)
+            chunk.source = 'hybrid_reranked'
+        
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)[:rerank_top_k]
+        
+        # Log retrieval stats
+        n_unique_from_bm25_dense = len(
+            set(c.chunk_id for c in bm25_results) | set(c.chunk_id for c in dense_results)
+        )
+        n_overlap = len(
+            set(c.chunk_id for c in bm25_results) & set(c.chunk_id for c in dense_results)
+        )
+        n_adjacent = len(candidates) - n_unique_from_bm25_dense + n_overlap
+        
+        print(
+            f"    [Retrieval] pool={len(candidates)} (bm25={len(bm25_results)} "
+            f"dense={len(dense_results)} adj={n_adjacent}) → rerank top-{rerank_top_k}"
+        )
+        
+        if legacy_mode:
+            return ranked
+
+        # Convert to standardized output format
+        return [chunk.to_dict() for chunk in ranked]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Module-level convenience functions
+# ────────────────────────────────────────────────────────────────────────────
+
+_corpus_index: Optional[CorpusIndex] = None
+
+
+def initialize_corpus(
+    chunks_jsonl: str = None,
+    chroma_db_path: str = None,
+) -> CorpusIndex:
+    """Initialize the global corpus index."""
+    global _corpus_index
+    
+    chunks_path = chunks_jsonl or CONFIG['sec_chunks_path']
+    chroma_path = chroma_db_path or CONFIG['chroma_db_path']
+    
+    _corpus_index = CorpusIndex(
+        chunks_jsonl=chunks_path,
+        chroma_db_path=chroma_path,
+    )
+    return _corpus_index
+
+
+def get_corpus() -> CorpusIndex:
+    """Get the global corpus index (lazily initialize if needed)."""
+    global _corpus_index
+    if _corpus_index is None:
+        initialize_corpus()
+    return _corpus_index
+
+
+def hybrid_search(
+    query: str,
+    top_k: int = None,
+    ticker: str = None,
+    filing_year: int = None,
+    form_type: str = None,
+) -> List[Dict[str, Any]]:
+    """
+    Public API for hybrid search. Initializes corpus on first call.
+    
+    Returns list of dicts with standardized schema:
+    {
+        'chunk_id': str,
+        'text': str,  # contextual chunk with headers
+        'raw_text': str,
+        'score': float,
+        'source': str,
+        'metadata': dict  # {ticker, company, form_type, filing_year, page_num, ...}
+    }
+    """
+    corpus = get_corpus()
+    return corpus.hybrid_search(query, top_k=top_k, ticker=ticker, filing_year=filing_year, form_type=form_type)
+
+
+if __name__ == '__main__':
+    # Test initialization
+    print("Testing shared_retriever module...")
+    corpus = initialize_corpus()
+    
+    # Example query
+    sample_query = "What were Apple's net revenues?"
+    print(f"\nTest query: {sample_query}")
+    results = corpus.hybrid_search(sample_query, top_k=3, ticker="AAPL")
+    
+    print(f"\nFound {len(results)} results:")
+    for i, result in enumerate(results, 1):
+        print(f"\n{i}. {result['metadata']['doc_name']}")
+        print(f"   Score: {result['score']:.3f} | Source: {result['source']}")
+        print(f"   Text: {result['text'][:200]}...")

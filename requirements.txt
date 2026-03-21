@@ -1,0 +1,46 @@
+# GenAI-with-LLMs Project Dependencies
+# Centralized requirements for all frameworks: LlamaIndex, CrewAI, LangGraph
+
+# ========== Core Data & ML Libraries ==========
+numpy>=1.26.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# ========== Embedding & Vector DB ==========
+chromadb>=0.4.0          # Vector database for SEC chunks
+sentence-transformers>=2.2.2  # Dense embeddings (all-mpnet-base-v2, nomic embedding)
+rank-bm25>=0.2.2         # BM25 sparse retrieval
+
+# ========== Reranking & Cross-Encoders ==========
+cross-encoder>=0.2.1     # CrossEncoder for reranking (ms-marco-MiniLM-L-6-v2)
+
+# ========== LlamaIndex Framework ==========
+llama-index-core>=0.10.0
+llama-index-vector-stores-chroma>=0.1.0
+llama-index-llms-groq>=0.1.0     # Groq LLM integration
+llama-index-llms-gemini>=0.1.0    # Google Gemini LLM integration
+
+# ========== LangGraph Framework ==========
+langgraph>=0.1.0
+langchain-core>=0.1.0
+langchain-groq>=0.1.0
+langchain-google-genai>=0.1.0
+
+# ========== CrewAI Framework ==========
+crewai>=0.30.0
+crewai-tools>=0.1.0
+
+# ========== LLM Providers ==========
+groq>=0.30.0             # Groq API client
+google-genai>=1.56.0     # Google Generative AI (Gemini)
+litellm>=1.0.0           # LLM abstraction layer
+
+# ========== Utilities ==========
+python-dotenv>=1.0.0     # Environment variable management
+pydantic>=2.0.0          # Data validation
+requests>=2.31.0         # HTTP library for EDGAR APIs
+tqdm>=4.65.0             # Progress bars
+
+# ========== Optional: Development & Debugging ==========
+# jupyter>=1.0.0          # Jupyter notebooks (usually pre-installed)
+# ipykernel>=6.0.0        # IPython kernel

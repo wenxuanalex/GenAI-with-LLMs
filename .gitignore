@@ -7,7 +7,9 @@
 # =========================
 # Logs / runtime outputs
 # =========================
+# Ignore all jsonl except chunks
 *.jsonl
+!sec_rag_team_share/sec_data/chunks/
 !sec_rag_team_share/sec_data/chunks/*.jsonl
 drift_log.jsonl
 sec_rag_team_share/sec_data/drift_log.jsonl

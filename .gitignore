@@ -8,23 +8,23 @@
 # Logs / runtime outputs
 # =========================
 # Ignore all jsonl except chunks
-*.jsonl
-!sec_rag_team_share/sec_data/chunks/
-!sec_rag_team_share/sec_data/chunks/*.jsonl
-drift_log.jsonl
-sec_rag_team_share/sec_data/drift_log.jsonl
+# *.jsonl
+# !sec_rag_team_share/sec_data/chunks/
+# !sec_rag_team_share/sec_data/chunks/*.jsonl
+# drift_log.jsonl
+# sec_rag_team_share/sec_data/drift_log.jsonl
 
-# =========================
-# Temp / scratch files
-# =========================
-tmp_*
-*.log
+# # =========================
+# # Temp / scratch files
+# # =========================
+# tmp_*
+# *.log
 
-# =========================
-# Generic local DB ignores
-# Keep Chroma DB for this project tracked,
-# but ignore other stray local DB files elsewhere
-# =========================
-*.db
-*.sqlite3
-!sec_rag_team_share/chroma_db/chroma.sqlite3
+# # =========================
+# # Generic local DB ignores
+# # Keep Chroma DB for this project tracked,
+# # but ignore other stray local DB files elsewhere
+# # =========================
+# *.db
+# *.sqlite3
+# !sec_rag_team_share/chroma_db/chroma.sqlite3

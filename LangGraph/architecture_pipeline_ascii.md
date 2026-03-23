@@ -1,156 +1,265 @@
 # Current SEC Agentic RAG Architecture (ASCII)
 
-Two proposal-level upgrades are explicitly included in the current design:
+This document reflects the latest flow in `langgraph_agentic_rag_sec_v4_lite.ipynb`.
 
-- `Query Decomposition` = the `Brain` upgrade
-  - The planner breaks multi-period / cross-company questions into 2 to 3 targeted sub-queries before retrieval.
-- `Refined Critic` = the `Guardrail` upgrade
-  - The critic can return `insufficient_data` so the agent exits safely instead of looping on unanswerable questions.
-- `Drift Detection + Auto-Ingestion`
-  - When the critic cannot find the needed filing data, the agent can log the miss, scrape the missing filing from EDGAR, ingest it, and retry retrieval.
+Key updates in the current notebook:
+
+- `Gemini startup model selector`
+  - The notebook now starts with a model preset choice before config is built.
+- `Advanced-RAG seeded agent run`
+  - `run_agentic_rag()` first calls `run_advanced_rag()` and seeds the LangGraph state with its retrieved chunks.
+  - If seeded retrieval is available, the graph starts at `query_planner` but skips straight to `context_evaluator` instead of re-retrieving immediately.
+- `Retrieval sanity check + context retry`
+  - Retrieved chunks are checked for obvious ticker/query mismatches.
+  - If context is weak, the graph can retry retrieval once before generation.
+- `Refined Critic + drift loop`
+  - The critic can still return `insufficient_data`.
+  - That path logs misses, optionally scrapes EDGAR, ingests new chunks, patches the live index, and retries retrieval.
 
 ```text
-+----------------------------------------------------------------------------------+
-|                              SEC DATA PREP                                       |
-|                        (from sec_rag_team_share)                                 |
-+----------------------------------------------------------------------------------+
-| Raw SEC filings (.html / inline XBRL)                                            |
-| -> chunking + metadata prep                                                      |
-| -> sec_chunks.jsonl                                                              |
-| -> ChromaDB dense store                                                          |
-+----------------------------------------------------------------------------------+
-                                         |
-                                         v
-+----------------------------------------------------------------------------------+
-|                    END-TO-END AGENTIC RAG SEQUENCE                               |
-+----------------------------------------------------------------------------------+
-| User Question                                                                    |
-|      |                                                                           |
-|      v                                                                           |
-| Planner [Agent]                                                                  |
-|   Query Decomposition ("Brain" upgrade)                                          |
-|   - figures out if the question should be split into smaller parts               |
-|   - creates 1 to 3 focused search requests                                       |
-|      |                                                                           |
-|      v                                                                           |
-| Retrieval Orchestrator [Agent]                                                   |
-|   - decides how retrieval should run for this question                           |
-|   - can search once or search each sub-question and combine the results          |
-|      |                                                                           |
-|      v                                                                           |
-| Hybrid Retriever [RAG]                                                           |
-|   - looks up the most useful filing snippets                                     |
-|                                                                                  |
-|      +--------------------------------------------------------------------+      |
-|      |          ADVANCED RAG STACK (inside retrieval) [RAG]              |       |
-|      | load_sec_chunks() [RAG]: load the prepared SEC filing chunks      |       |
-|      | -> sec_df_to_chunk_dicts() [RAG]: shape chunks for retrieval      |       |
-|      | -> BM25 [RAG]: keyword search                                     |       |
-|      | -> Dense retrieval [RAG]: embedding / similarity search           |       | 
-|      | -> RRF merge [RAG]: combine BM25 + dense results                  |       | 
-|      | -> Reranker [RAG]: sort the best snippets                         |       | 
-|      | -> Retrieved context [RAG]: final evidence sent back              |       |
-|      +--------------------------------------------------------------------+      |
-|      |                                                                           |
-|      v                                                                           |
-| Context Evaluator [Agent]                                                        |
-|   - checks whether the retrieved evidence looks useful                           |
-|   - if not, asks retrieval to try again                                          |
-|      |                                                                           |
-|      v                                                                           |
-| Generator [Agent]                                                                |
-|   - writes a first draft answer using the filing evidence                        |
-|      |                                                                           |
-|      v                                                                           |
-| Critic [Agent]                                                                   |
-|   Refined Critic ("Guardrail" upgrade)                                           |
-|   - decides whether the draft looks good, fixable, or unsupported                |
-|   - can safely stop, or trigger a fresh EDGAR ingest when the corpus is stale    |
-|                      |                                                           |
-|        +-------------+------------------------------+                            |
-|        |                                            |                            |
-|        v                                            v                            |
-| Repair [Agent]                                                                   |
-|   - fixes the draft when the problem looks fixable                               |
-|   - can ask for another retrieval pass if better evidence is needed              |
-|                                                                                  |
-| Drift Detector [Agent]                                                           |
-|   - logs repeated corpus misses by ticker / year / form                          |
-|   - decides when the missing filing should be fetched                            |
-|      |                                                                           |
-|      v                                                                           |
-| EDGAR Scrape + Ingest [Agent + SEC Data Prep]                                    |
-|   - downloads the missing filing from SEC EDGAR                                  |
-|   - chunks it, upserts it into ChromaDB, rebuilds BM25, then retries retrieval   |
-+----------------------------------------------------------------------------------+
-                                         |
-                                         v
-+----------------------------------------------------------------------------------+
-|                          EVALUATION / COMPARISON                                 |
-+----------------------------------------------------------------------------------+
-| Simple RAG | Advanced RAG | Agentic RAG                                          |
-| -> compare outputs from the different pipelines                                  |
-| -> score against gold QA answers / evidence                                      |
-| -> optionally add an LLM judge for softer answer-quality checks                  |
-| -> produce the final metrics table                                               |
-+----------------------------------------------------------------------------------+
++--------------------------------------------------------------------------------------------------+
+|                                      NOTEBOOK STARTUP                                            |
++--------------------------------------------------------------------------------------------------+
+| User selects Gemini preset                                                                       |
+| -> builds CONFIG                                                                                 |
+| -> loads shared CorpusIndex / dense embedder / reranker                                          |
++--------------------------------------------------------------------------------------------------+
+                                                |
+                                                v
++--------------------------------------------------------------------------------------------------+
+|                                        SEC DATA PREP                                             |
++--------------------------------------------------------------------------------------------------+
+| Raw SEC filings (.html / inline XBRL)                                                            |
+| -> chunking + metadata normalization                                                             |
+| -> sec_chunks.jsonl                                                                              |
+| -> ChromaDB dense store                                                                          |
+| -> shared_retriever.CorpusIndex                                                                  |
++--------------------------------------------------------------------------------------------------+
+                                                |
+                                                v
++--------------------------------------------------------------------------------------------------+
+|                             THREE PIPELINES USED IN THE NOTEBOOK                                 |
++--------------------------------------------------------------------------------------------------+
+| 1. Simple RAG                                                                                    |
+|    dense retrieval -> generate                                                                   |
+|                                                                                                  |
+| 2. Advanced RAG                                                                                  |
+|    rewrite -> multi-query -> retrieve -> RRF merge -> rerank -> compress -> generate            |
+|                                                                                                  |
+| 3. Agentic RAG (LangGraph)                                                                       |
+|    starts from Advanced-RAG output and adds control-flow, critique, repair, and drift handling   |
++--------------------------------------------------------------------------------------------------+
+                                                |
+                                                v
++--------------------------------------------------------------------------------------------------+
+|                           AGENTIC RAG (LATEST LANGGRAPH FLOW)                                    |
++--------------------------------------------------------------------------------------------------+
+| User Question                                                                                    |
+|      |                                                                                           |
+|      v                                                                                           |
+| run_advanced_rag(question, index)                                                                |
+|   - rewrite_query()                                                                              |
+|   - generate_multi_queries()                                                                     |
+|   - run retrieval per query variant                                                              |
+|   - RRF merge                                                                                    |
+|   - rerank                                                                                       |
+|   - compress retrieved context                                                                   |
+|   - generate_with_citations()                                                                    |
+|      |                                                                                           |
+|      v                                                                                           |
+| Seed LangGraph state                                                                             |
+|   - rewritten_query                                                                              |
+|   - retrieved_chunks                                                                             |
+|   - retrieved_doc_names                                                                          |
+|   - use_seeded_retrieval=True when advanced retrieval succeeded                                  |
+|      |                                                                                           |
+|      v                                                                                           |
+| Query Planner [Agent]                                                                            |
+|   - emits rewritten query + structured sub_queries                                               |
+|   - can mark needs_decomposition                                                                 |
+|   - if seeded retrieval exists, preserves that seeded query/sub-query state                      |
+|      |                                                                                           |
+|      +-------------------------------+-----------------------------------------------------------+
+|                                      |                                                           |
+|                                      v                                                           |
+|                           Seeded retrieval available?                                            |
+|                                      |                                                           |
+|                     yes -------------------------------> Context Evaluator [Agent]               |
+|                                      |                                                           |
+|                     no                                v                                           |
+|                                      +-------> Hybrid Retriever [RAG]                            |
+|                                                  - may retrieve once or per sub-query            |
+|                                                  - merges multi-query results                    |
+|                                                  - runs retrieval sanity check                   |
+|                                                  - outputs retrieved_chunks + doc names          |
+|                                                          |                                       |
+|                                                          v                                       |
+|                                                Context Evaluator [Agent]                         |
+|                                                - if sanity check failed, marks context bad       |
+|                                                - otherwise judges relevance/sufficiency          |
+|                                                          |                                       |
+|                         +--------------------------------+-------------------+                   |
+|                         |                                                    |                   |
+|                         v                                                    v                   |
+|                context good                                         context weak                 |
+|                         |                                             and retry budget left      |
+|                         v                                                    |                   |
+|                  Generator [Agent]                                          v                   |
+|                  - answer with citations                           Increment Context Retry        |
+|                  - uses retrieved SEC evidence                              |                   |
+|                         |                                                    v                   |
+|                         v                                           Hybrid Retriever [RAG]       |
+|                   Critic [Agent]                                                                    |
+|                   - accept                                                                          |
+|                   - repair                                                                          |
+|                   - insufficient_data                                                               |
+|                         |                                                                            |
+|          +--------------+----------------------------+                                              |
+|          |                                           |                                              |
+|          v                                           v                                              |
+|      accept -> END                           Repair [Agent]                                         |
+|                                              - revises answer                                       |
+|                                              - may request new retrieval                            |
+|                                                       |                                             |
+|                            +--------------------------+----------------------+                      |
+|                            |                                                 |                      |
+|                            v                                                 v                      |
+|                       end -> END                             Mark Repair Retrieval                   |
+|                                                              -> Hybrid Retriever                    |
+|                                                              -> Generator                           |
+|                                                              -> Critic                              |
+|                                                              -> END after repair cycle              |
+|                                                                                                     |
+|      insufficient_data                                                                              |
+|               |                                                                                     |
+|               v                                                                                     |
+|      Drift Detector [Agent/Controller]                                                              |
+|      - logs miss by (ticker, filing_year, form_type)                                                |
+|      - checks scrape threshold                                                                      |
+|               |                                                                                     |
+|         +-----+-------------------------------+                                                     |
+|         |                                     |                                                     |
+|         v                                     v                                                     |
+|    no threshold                         threshold crossed                                           |
+|         |                                     |                                                     |
+|         v                                     v                                                     |
+|      END                           Scrape + Ingest Missing Filing                                   |
+|                                    - download from EDGAR                                            |
+|                                    - chunk filing                                                   |
+|                                    - upsert ChromaDB                                                |
+|                                    - hot-patch CorpusIndex dataframe + BM25                         |
+|                                    - clear critic state                                             |
+|                                             |                                                       |
+|                               +-------------+-------------+                                         |
+|                               |                           |                                         |
+|                               v                           v                                         |
+|                      ingestion ran                  nothing ingested                                |
+|                               |                           |                                         |
+|                               v                           v                                         |
+|                     Hybrid Retriever [RAG]              END                                         |
++--------------------------------------------------------------------------------------------------+
+                                                |
+                                                v
++--------------------------------------------------------------------------------------------------+
+|                                   EVALUATION / EXPORT                                             |
++--------------------------------------------------------------------------------------------------+
+| For each question:                                                                                |
+| -> run Simple RAG                                                                                 |
+| -> run Advanced RAG                                                                               |
+| -> run Agentic RAG                                                                                |
+| -> optionally run LLM judge for correctness + faithfulness                                        |
+| -> collect route trace, model snapshot, retrieval stats, repair stats, and final metrics          |
+| -> export aligned result tables / eval CSVs                                                       |
++--------------------------------------------------------------------------------------------------+
 ```
 
 ## Boundary Summary
 
 - `SEC Data Prep`
-  - Relied on `sec_rag_team_share`
-  - Produced the prepared filing corpus and persisted dense store
+  - Produces chunked SEC filing text plus metadata.
+  - Persists the dense store and the JSONL corpus used by `shared_retriever`.
 
 - `RAG`
-  - Starts when the notebook loads `sec_chunks.jsonl`
-  - Owns indexing, hybrid retrieval, and reranking
+  - Lives inside `shared_retriever.CorpusIndex` plus the notebook retrieval helpers.
+  - Owns dense retrieval, per-query retrieval, RRF merge, reranking, compression, and retrieved-context formatting.
 
 - `Agent`
-  - Owns planning, retrieval control flow, answer generation, critique, repair, and drift-triggered ingestion
-  - Includes `Query Decomposition` as the planning upgrade
-  - Includes `Refined Critic` as the safe-stop guardrail
-  - Includes a drift branch that can scrape and ingest missing filings from EDGAR
+  - Owns planning, context evaluation, answer generation, critique, repair, retry routing, and drift-triggered ingestion.
+  - In the current notebook, Agentic RAG is seeded by the Advanced-RAG retrieval output.
 
 - `Evaluation`
-  - Compares simple, advanced, and agentic pipelines
-  - Primarily uses gold QA metrics from the labeled SEC eval set
-  - Can optionally use an LLM judge for correctness and faithfulness
+  - Runs simple, advanced, and agentic pipelines side by side.
+  - Can apply an LLM judge during the main eval loop.
+  - Exports detailed aligned rows and summary metrics.
 
 ## Function Cheat Sheet
 
-- `RAG Layer`
-  - `load_sec_chunks()`: loads the prepared SEC chunk dataset from JSONL.
-  - `sec_df_to_chunk_dicts()`: converts the DataFrame into the chunk format used by retrieval.
-  - `CorpusIndex`: wraps BM25, dense retrieval, hybrid merge, and reranking.
-  - `bm25_search()`: keyword retrieval over chunk text.
-  - `dense_search()`: embedding-based retrieval over ChromaDB.
-  - `hybrid_search()`: combines BM25 and dense hits, then reranks the merged set.
+- `Retrieval / Advanced-RAG Layer`
+  - `rewrite_query()`: rewrites the user question for cleaner retrieval.
+  - `generate_multi_queries()`: produces multiple retrieval variants.
+  - `rrf_merge_retrieved()`: merges ranked lists with reciprocal rank fusion.
+  - `rerank_retrieved()`: reranks merged candidates with the cross-encoder reranker.
+  - `compress_retrieved_context()`: trims chunks to the most relevant supporting sentences.
+  - `generate_with_citations()`: generates an answer from retrieved evidence.
+  - `fails_retrieval_sanity_check()`: catches obvious mismatch cases before generation.
 
-- `Agent Layer`
-  - `node_query_planner()`: decides whether to decompose the question and emits sub-queries.
-  - `node_hybrid_retriever()`: retrieves chunks for one query or multiple sub-queries.
-  - `node_context_evaluator()`: checks whether retrieved context is relevant enough to continue.
-  - `node_generator()`: drafts an answer using retrieved SEC context.
-  - `node_critic()`: checks whether the draft is grounded, repairable, or unsupported.
-  - `node_repair()`: revises the answer or asks for another retrieval pass.
-  - `node_mark_repair_retrieval()`: tags the retrieval as repair-driven to avoid bad loops.
-  - `node_drift_detector()`: logs repeated corpus misses and decides whether to fetch a missing filing.
-  - `node_scrape_and_ingest()`: scrapes from EDGAR, chunks the filing, ingests it into ChromaDB, and refreshes retrieval.
+- `Graph / Agent Layer`
+  - `node_query_planner()`: produces normalized sub-queries and decomposition metadata.
+  - `node_hybrid_retriever()`: runs retrieval, merges multi-query hits, and applies the sanity check.
+  - `node_context_evaluator()`: judges whether the retrieved evidence is usable.
+  - `node_increment_context_retry()`: increments retry count before re-retrieval.
+  - `node_generator()`: drafts the answer from retrieved SEC context.
+  - `node_critic()`: decides `accept`, `repair`, or `insufficient_data`.
+  - `node_repair()`: revises the answer and may request one more retrieval pass.
+  - `node_mark_repair_retrieval()`: tags the next retrieval as repair-driven.
+  - `node_drift_detector()`: logs misses and determines whether scraping should trigger.
+  - `node_scrape_and_ingest()`: fetches missing filings, chunks them, ingests them, and refreshes the live index.
+  - `build_agentic_graph()`: wires the full LangGraph control flow.
+
+## Current LangGraph Routing
+
+- Entry: `query_planner`
+- `query_planner`
+  - seeded retrieval available -> `context_evaluator`
+  - otherwise -> `hybrid_retriever`
+- `hybrid_retriever` -> `context_evaluator`
+- `context_evaluator`
+  - relevant -> `generator`
+  - not relevant and retry budget remains -> `increment_context_retry -> hybrid_retriever`
+  - not relevant and retry budget exhausted -> `generator`
+- `generator` -> `critic`
+- `critic`
+  - `accept` -> `END`
+  - `repair` -> `repair`
+  - `insufficient_data` -> `drift_detector`
+- `repair`
+  - `needs_new_retrieval` -> `mark_repair_retrieval -> hybrid_retriever`
+  - otherwise -> `END`
+- `drift_detector`
+  - scrape threshold crossed -> `scrape_and_ingest`
+  - otherwise -> `END`
+- `scrape_and_ingest`
+  - ingestion happened -> `hybrid_retriever`
+  - otherwise -> `END`
 
 ## Included Proposal Concepts
 
 - `Proposal 1: Query Decomposition`
   - Included
-  - Implemented in the planner node before retrieval
-  - Addresses the single-query gap for compare/contrast, cross-company, and multi-period questions
+  - Implemented in `node_query_planner()`
+  - Supports structured sub-queries for compare/contrast and multi-period questions
 
 - `Proposal 2: Refined Critic`
   - Included
-  - Implemented in the critic schema and routing
-  - Adds `insufficient_data` so the system can stop safely when the filing does not contain the answer
+  - Implemented in `node_critic()` and `route_critic()`
+  - Adds `insufficient_data` for safe stop / drift escalation
 
 - `Proposal 3: Drift Detection + Auto-Ingestion`
-  - Included in `langgraph_agentic_rag_sec_v3.ipynb`
-  - Implemented as a branch from `critic -> drift_detector -> scrape_and_ingest -> hybrid_retriever`
-  - Lets the system fetch missing SEC filings when repeated misses suggest the corpus is stale
+  - Included
+  - Implemented via `node_drift_detector()` and `node_scrape_and_ingest()`
+  - Retries retrieval after successful EDGAR ingestion
+
+- `Proposal 4: Retrieval sanity + retry guardrail`
+  - Included in the latest lite notebook flow
+  - Detects likely ticker/query mismatch before generation
+  - Allows one context retry before continuing

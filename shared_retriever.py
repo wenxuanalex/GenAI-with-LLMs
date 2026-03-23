@@ -11,12 +11,11 @@ Framework-agnostic hybrid retrieval pipeline:
 This module is designed to be used identically across CrewAI, LlamaIndex, and LangGraph.
 """
 
-import os
 import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -87,10 +86,40 @@ class RetrievedChunk:
 # Global Model Instances (loaded once at module import)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _resolve_trust_remote_code(model_name: str) -> bool:
+    """
+    Resolve trust_remote_code with a conservative policy.
+
+    - true/false/1/0 in config are honored explicitly.
+    - auto enables trust only for allowlisted models known to require it.
+    """
+    raw_value = str(CONFIG.get('dense_trust_remote_code', 'auto')).strip().lower()
+    if raw_value in {'1', 'true', 'yes', 'on'}:
+        return True
+    if raw_value in {'0', 'false', 'no', 'off'}:
+        return False
+
+    allowlist = {
+        'nomic-ai/nomic-embed-text-v1.5',
+    }
+    return model_name in allowlist
+
+
 def _load_models():
     """Load dense embedding and reranker models."""
-    print(f"Loading embedding model: {CONFIG['dense_model_name']}...")
-    dense_model = SentenceTransformer(CONFIG['dense_model_name'])
+    model_name = CONFIG['dense_model_name']
+    trust_remote_code = _resolve_trust_remote_code(model_name)
+    print(f"Loading embedding model: {model_name}...")
+    dense_model = SentenceTransformer(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    )
+    if trust_remote_code:
+        warnings.warn(
+            f"trust_remote_code=True for dense model '{model_name}'. "
+            "Only enable this for trusted model repositories.",
+            RuntimeWarning,
+        )
     
     print(f"Loading reranker model: {CONFIG['reranker_model_name']}...")
     reranker = CrossEncoder(CONFIG['reranker_model_name'])
@@ -175,12 +204,21 @@ class CorpusIndex:
         
         print(f"Loaded {len(self.df)} chunks")
 
+        # Build contextual chunk column to mirror advanced notebook retrieval behavior.
+        self.df['contextual_chunk'] = self.df.apply(
+            lambda row: self._contextual_from_meta(
+                str(row.get('text', '')),
+                row.get('metadata', {}) if isinstance(row.get('metadata', {}), dict) else {},
+            ),
+            axis=1,
+        )
+
         # Build BM25 index
         print("Building BM25 index...")
         if 'chunk_id_str' not in self.df.columns:
             self.df['chunk_id_str'] = self.df['chunk_id'].astype(str)
         if 'bm25_tokens' not in self.df.columns:
-            self.df['bm25_tokens'] = self.df['text'].fillna('').astype(str).str.lower().str.split()
+            self.df['bm25_tokens'] = self.df['contextual_chunk'].fillna('').astype(str).str.lower().str.split()
         self.bm25 = BM25Okapi(
             self.df['bm25_tokens'].tolist()
         )
@@ -339,7 +377,8 @@ class CorpusIndex:
     ) -> List[RetrievedChunk]:
         """Dense embedding search via Chroma."""
         # Use query prefix matching Nomic embedding expectations
-        query_with_prefix = f"search_query: {query}"
+        query_prefix = str(CONFIG.get('dense_query_prefix', 'search_query: '))
+        query_with_prefix = f"{query_prefix}{query}" if query_prefix else query
         q_emb = self.dense_model.encode([query_with_prefix], normalize_embeddings=True)[0].tolist()
         
         where = self._chroma_where(ticker, filing_year, form_type)
@@ -427,17 +466,23 @@ class CorpusIndex:
         Returns standardized list of dicts with text, metadata, score, source.
         """
         # Use config defaults if not provided
-        bm25_top_k = bm25_top_k or CONFIG['bm25_top_k']
-        dense_top_k = dense_top_k or CONFIG['dense_top_k']
-        rerank_top_k = rerank_top_k or top_k or CONFIG['rerank_top_k']
-        expand_n = expand_n if expand_n is not None else CONFIG.get('adjacent_chunk_expansion_n', 1)
-        
         legacy_mode = any(
             x is not None for x in [bm25_top_k, dense_top_k, rerank_top_k, embed_model, reranker]
         )
 
+        bm25_top_k = bm25_top_k or CONFIG['bm25_top_k']
+        dense_top_k = dense_top_k or CONFIG['dense_top_k']
+        rerank_top_k = rerank_top_k or top_k or CONFIG['rerank_top_k']
+        expand_n = expand_n if expand_n is not None else CONFIG.get('adjacent_chunk_expansion_n', 1)
+
+        if embed_model is not None:
+            self.dense_model = embed_model
+        if reranker is not None:
+            self.reranker = reranker
+
         # 1. BM25 Search
-        bm25_results = self.bm25_search(query, top_k=bm25_top_k)
+        bm25_mask = self._bm25_mask(ticker=ticker, filing_year=filing_year, form_type=form_type)
+        bm25_results = self.bm25_search(query, top_k=bm25_top_k, mask=bm25_mask)
         
         # 2. Dense Search
         dense_results = self.dense_search(
@@ -446,7 +491,7 @@ class CorpusIndex:
         )
         
         # 3. RRF Merge
-        rrf_k = 60  # Standard RRF smoothing constant
+        rrf_k = int(CONFIG.get('rrf_k', 60))
         def _rrf_score(rank: int, k: int = rrf_k) -> float:
             return 1.0 / (k + rank)
         

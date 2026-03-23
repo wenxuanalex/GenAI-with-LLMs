@@ -3,11 +3,11 @@ Centralized Configuration Module
 =================================
 Authoritative configuration for all agentic RAG frameworks (CrewAI, LlamaIndex, LangGraph).
 
-Source of Truth: CrewAI notebook (crewai_agentic_rag_sec.ipynb)
+Source of Truth: Advanced RAG notebook (advanced_rag_upgrade_v2 805pm.ipynb)
 
 This module provides a single CONFIG dict that ensures synchronized hyperparameters,
 model IDs, and retrieval settings across all three framework implementations.
-All environment variables are loaded with sensible defaults from CrewAI.
+All environment variables are loaded with sensible defaults from the advanced notebook.
 """
 
 import os
@@ -96,19 +96,22 @@ def load_config() -> Dict[str, Any]:
         'auto_export_results_input': True,
 
         # ────────────────────────────────────────────────────────────────────
-        # Retrieval Hyperparameters (AUTHORITATIVE FROM CREWAI)
+        # Retrieval Hyperparameters (AUTHORITATIVE FROM ADVANCED NOTEBOOK)
         # ────────────────────────────────────────────────────────────────────
-        'bm25_top_k':                       int(os.getenv('BM25_TOP_K',                 '8')),
-        'dense_top_k':                      int(os.getenv('DENSE_TOP_K',                '8')),
-        'rerank_top_k':                     int(os.getenv('RERANK_TOP_K',               '5')),
+        'bm25_top_k':                       int(os.getenv('BM25_TOP_K',                 '15')),
+        'dense_top_k':                      int(os.getenv('DENSE_TOP_K',                '15')),
+        'rerank_top_k':                     int(os.getenv('RERANK_TOP_K',               '7')),
         'decomposition_top_k_per_subquery': int(os.getenv('DECOMP_TOP_K_PER_SUBQUERY',  '4')),
         'adjacent_chunk_expansion_n':       int(os.getenv('ADJACENT_EXPANSION_N',       '1')),
+        'rrf_k':                            int(os.getenv('RRF_K',                      '60')),
 
         # ────────────────────────────────────────────────────────────────────
-        # Embedding & Reranking Models (AUTHORITATIVE FROM CREWAI)
+        # Embedding & Reranking Models (AUTHORITATIVE FROM ADVANCED NOTEBOOK)
         # ────────────────────────────────────────────────────────────────────
         'dense_model_name':    os.getenv('DENSE_MODEL_NAME',
-                                         'sentence-transformers/all-mpnet-base-v2'),
+                         'nomic-ai/nomic-embed-text-v1.5'),
+        'dense_query_prefix':  os.getenv('DENSE_QUERY_PREFIX', 'search_query: '),
+        'dense_trust_remote_code': os.getenv('DENSE_TRUST_REMOTE_CODE', 'auto'),
         'reranker_model_name': os.getenv('RERANKER_MODEL_NAME',
                                          'cross-encoder/ms-marco-MiniLM-L-6-v2'),
 
@@ -183,7 +186,7 @@ def load_config() -> Dict[str, Any]:
         # Rate Limiting & Pacing
         # ────────────────────────────────────────────────────────────────────
         'max_rpm':                  10,  # Default; overridden by provider_rpm
-        'inter_question_sleep_sec': 1.5,
+        'inter_question_sleep_sec': float(os.getenv('INTER_QUESTION_SLEEP_SEC', '40')),
         'llm_max_retries':          3,
         'llm_retry_base_delay_sec': 5,
 

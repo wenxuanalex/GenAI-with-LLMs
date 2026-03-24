@@ -12,10 +12,12 @@ This module is designed to be used identically across CrewAI, LlamaIndex, and La
 """
 
 import json
+import re
+import shutil
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,6 +44,25 @@ def _resolve_existing_path(path_str: str) -> Path:
         if root_candidate.exists():
             return root_candidate
     return p
+
+
+def _sqlite_header_ok(sqlite_path: Path) -> bool:
+    """Return True when the file begins with the standard SQLite header."""
+    try:
+        with sqlite_path.open('rb') as f:
+            return f.read(16) == b'SQLite format 3\x00'
+    except OSError:
+        return False
+
+
+def _looks_like_lfs_pointer(file_path: Path) -> bool:
+    """Detect common Git LFS pointer files."""
+    try:
+        with file_path.open('rb') as f:
+            head = f.read(64)
+        return head.startswith(b'version https://git-lfs.github.com/spec/')
+    except OSError:
+        return False
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -164,6 +185,8 @@ class CorpusIndex:
         """
         self.chunks_path = _resolve_existing_path(chunks_jsonl)
         self.chroma_db_path = _resolve_existing_path(chroma_db_path)
+        self.chroma_sqlite_path = self.chroma_db_path / 'chroma.sqlite3'
+        self.chroma_runtime_path = self.chroma_db_path
         
         if not self.chunks_path.exists():
             raise FileNotFoundError(f"Chunks JSONL not found: {self.chunks_path}")
@@ -223,30 +246,154 @@ class CorpusIndex:
             self.df['bm25_tokens'].tolist()
         )
 
-        # Connect to Chroma DB
-        print(f"Connecting to Chroma DB at {self.chroma_db_path}...")
-        self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_db_path))
-        collections = self.chroma_client.list_collections()
-        if collections:
-            self.chroma_collection = self.chroma_client.get_collection(collections[0].name)
-        else:
-            self.chroma_collection = self.chroma_client.get_or_create_collection(name="sec_filings")
-        # Backward-compatible alias used by older notebook code.
-        self.collection = self.chroma_collection
-        print(f"Chroma collection: {self.chroma_collection.count()} vectors")
-
         # Use global models or accept overrides
         self.dense_model = _dense_model
         self.reranker = _reranker
+
+        # Connect to Chroma DB, rebuilding locally if the persisted store is invalid.
+        self.chroma_client, self.chroma_collection = self._initialize_chroma()
+        # Backward-compatible alias used by older notebook code.
+        self.collection = self.chroma_collection
+        print(f"Chroma collection: {self.chroma_collection.count()} vectors")
 
         # Build internal lookup maps for adjacent chunk expansion
         self._build_lookup_maps()
         print("CorpusIndex ready.")
 
+    def _initialize_chroma(self):
+        """Open the persisted Chroma collection or rebuild it from chunks if needed."""
+        print(f"Connecting to Chroma DB at {self.chroma_db_path}...")
+        needs_rebuild = False
+
+        if not self.chroma_sqlite_path.exists():
+            print(f"[Chroma] Missing {self.chroma_sqlite_path.name}; rebuilding local vector store.")
+            needs_rebuild = True
+        elif _looks_like_lfs_pointer(self.chroma_sqlite_path):
+            print(
+                "[Chroma] Detected a Git LFS pointer instead of a real SQLite database. "
+                "Rebuilding local Chroma store from sec_chunks.jsonl."
+            )
+            needs_rebuild = True
+        elif not _sqlite_header_ok(self.chroma_sqlite_path):
+            print(
+                f"[Chroma] Invalid SQLite header in {self.chroma_sqlite_path.name}. "
+                "Rebuilding local Chroma store from sec_chunks.jsonl."
+            )
+            needs_rebuild = True
+
+        if needs_rebuild:
+            self.chroma_runtime_path = self._local_rebuild_path()
+            return self._rebuild_chroma_store()
+
+        try:
+            client = chromadb.PersistentClient(path=str(self.chroma_runtime_path))
+            collections = client.list_collections()
+            if collections:
+                collection = client.get_collection(collections[0].name)
+            else:
+                print("[Chroma] No collections found; rebuilding local vector store.")
+                self.chroma_runtime_path = self._local_rebuild_path()
+                return self._rebuild_chroma_store()
+            if collection.count() == 0:
+                print("[Chroma] Collection is empty; rebuilding local vector store.")
+                self.chroma_runtime_path = self._local_rebuild_path()
+                return self._rebuild_chroma_store()
+            return client, collection
+        except Exception as exc:
+            print(f"[Chroma] Failed to open persisted store ({exc}). Rebuilding local vector store.")
+            self.chroma_runtime_path = self._local_rebuild_path()
+            return self._rebuild_chroma_store()
+
+    def _local_rebuild_path(self) -> Path:
+        """Return a clean local path for rebuilt Chroma artifacts."""
+        return (PROJECT_ROOT / ".cache" / "rebuilt_chroma_db").resolve()
+
+    def _rebuild_chroma_store(self):
+        """Recreate the Chroma DB from chunk text and locally computed embeddings."""
+        rebuild_path = self.chroma_runtime_path
+        print(f"[Chroma] Rebuild target: {rebuild_path}")
+        if rebuild_path.exists():
+            shutil.rmtree(rebuild_path, ignore_errors=True)
+        rebuild_path.mkdir(parents=True, exist_ok=True)
+
+        client = chromadb.PersistentClient(path=str(rebuild_path))
+        collection = client.get_or_create_collection(name="sec_filings")
+
+        batch_size = 128
+        total = len(self.df)
+        print(f"[Chroma] Rebuilding vector store with {total:,} chunks...")
+
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch = self.df.iloc[start:end]
+            texts = batch['contextual_chunk'].fillna('').astype(str).tolist()
+            embeddings = self.dense_model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).tolist()
+            metadatas = [self._normalize_chroma_metadata(meta) for meta in batch['metadata'].tolist()]
+            ids = batch['chunk_id'].astype(str).tolist()
+            collection.add(
+                ids=ids,
+                documents=texts,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
+            if start == 0 or end == total or (start // batch_size) % 10 == 0:
+                print(f"[Chroma] Indexed {end:,}/{total:,} chunks")
+
+        return client, collection
+
+    def _normalize_chroma_metadata(self, meta: Any) -> Dict[str, Any]:
+        """Convert metadata to Chroma-safe primitive values."""
+        if not isinstance(meta, dict):
+            return {}
+
+        normalized = {}
+        for key, value in meta.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                normalized[key] = value
+            else:
+                normalized[key] = str(value)
+        return normalized
+
+    @staticmethod
+    def _normalize_section_label(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text)
+        return text.strip("_")
+
+    def _parse_section_style_id(self, doc_id: str) -> Optional[Tuple[str, str, str, str]]:
+        """
+        Parse Chroma ids like:
+        NVDA_10-K_2024-02-21_Item_1A_-_Risk_Factors
+        NVDA_10-Q_2023-11-21_Item_1A_-_Risk_Factors_(10-Q)
+        """
+        parts = str(doc_id or "").split("_")
+        if len(parts) < 4:
+            return None
+        ticker = parts[0].upper()
+        form_type = parts[1].upper()
+        filing_date = parts[2]
+        section_raw = "_".join(parts[3:])
+        section_norm = self._normalize_section_label(section_raw)
+        if not ticker or not form_type or not filing_date or not section_norm:
+            return None
+        return (ticker, form_type, filing_date, section_norm)
+
     def _build_lookup_maps(self):
         """Build internal maps for O(1) adjacent chunk lookup."""
         # Map: chunk_id -> row index
         self._str_to_row = {str(cid): idx for idx, cid in enumerate(self.df['chunk_id'])}
+        # Fallback map for dense hits when Chroma ids do not match chunk_id exactly.
+        self._contextual_to_rows = {}
+        for idx, text in enumerate(self.df['contextual_chunk'].fillna('').astype(str)):
+            self._contextual_to_rows.setdefault(text, []).append(idx)
+        # Map section-style ids back to chunk rows using filing metadata.
+        self._sectionkey_to_rows = {}
         
         # Map: (ticker, form_type, filing_date) -> chunk_index -> row_index
         # Allows fast adjacent chunk lookup within same filing
@@ -263,11 +410,15 @@ class CorpusIndex:
             form_type = meta.get('form_type', '')
             filing_date = meta.get('filing_date', '')
             chunk_index = int(meta.get('chunk_index', 0))
+            section_norm = self._normalize_section_label(meta.get('section_title', ''))
             
             filing_key = (ticker, form_type, filing_date)
             if filing_key not in self._filing_chunk_lookup:
                 self._filing_chunk_lookup[filing_key] = {}
             self._filing_chunk_lookup[filing_key][chunk_index] = idx
+            if ticker and form_type and filing_date and section_norm:
+                section_key = (str(ticker).upper(), str(form_type).upper(), str(filing_date), section_norm)
+                self._sectionkey_to_rows.setdefault(section_key, []).append(idx)
 
     def _chunk_from_row(
         self, row_idx: int, score: float, source: str
@@ -317,17 +468,31 @@ class CorpusIndex:
         """Build Chroma metadata filter."""
         conditions = []
         if ticker:
-            conditions.append({"ticker": {"$eq": ticker}})
+            conditions.append({"ticker": {"$eq": str(ticker).upper()}})
         if filing_year:
-            conditions.append({"filing_year": {"$eq": filing_year}})
+            conditions.append({"filing_year": {"$eq": int(filing_year)}})
         if form_type:
-            conditions.append({"form_type": {"$eq": form_type}})
+            conditions.append({"form_type": {"$eq": str(form_type).upper()}})
         
         if not conditions:
             return None
         if len(conditions) == 1:
             return conditions[0]
         return {"$and": conditions}
+
+    def _meta_matches_filters(
+        self, meta: Dict[str, Any], ticker: str = None, filing_year: int = None, form_type: str = None
+    ) -> bool:
+        """Apply the same filter semantics used by BM25 to Chroma metadata."""
+        if not isinstance(meta, dict):
+            return False
+        if ticker and str(meta.get('ticker', '')).upper() != str(ticker).upper():
+            return False
+        if filing_year and int(meta.get('filing_year', 0) or 0) != int(filing_year):
+            return False
+        if form_type and str(meta.get('form_type', '')).upper() != str(form_type).upper():
+            return False
+        return True
 
     def _bm25_mask(
         self, ticker: str = None, filing_year: int = None, form_type: str = None
@@ -388,8 +553,62 @@ class CorpusIndex:
             where=where,
             include=['distances', 'metadatas', 'documents']
         )
-        
+        raw_filtered_hits = len(results['ids'][0]) if results.get('ids') and results['ids'] else 0
+        broad_hits = 0
+        locally_filtered_hits = raw_filtered_hits
+
+        fallback_mode = 'strict'
+        if not results['ids'] or not results['ids'][0]:
+            # If strict Chroma metadata filtering misses, retry broadly and apply local filter logic.
+            retry_n = max(top_k * 4, top_k)
+            broad_results = self.chroma_collection.query(
+                query_embeddings=[q_emb],
+                n_results=retry_n,
+                include=['distances', 'metadatas', 'documents']
+            )
+            broad_hits = len(broad_results['ids'][0]) if broad_results.get('ids') and broad_results['ids'] else 0
+            filtered_ids = []
+            filtered_docs = []
+            filtered_dists = []
+            filtered_metas = []
+            fallback_filters = [
+                ('strict_local', dict(ticker=ticker, filing_year=filing_year, form_type=form_type)),
+                # Fiscal-year questions often need filing-year relaxation while keeping company/form constraints.
+                ('relax_year', dict(ticker=ticker, filing_year=None, form_type=form_type)),
+                ('ticker_only', dict(ticker=ticker, filing_year=None, form_type=None)),
+                ('unfiltered', dict(ticker=None, filing_year=None, form_type=None)),
+            ]
+            for mode_name, mode_filters in fallback_filters:
+                filtered_ids = []
+                filtered_docs = []
+                filtered_dists = []
+                filtered_metas = []
+                for doc_id, text, dist, meta in zip(
+                    broad_results['ids'][0],
+                    broad_results['documents'][0],
+                    broad_results['distances'][0],
+                    broad_results['metadatas'][0],
+                ):
+                    if self._meta_matches_filters(meta, **mode_filters):
+                        filtered_ids.append(doc_id)
+                        filtered_docs.append(text)
+                        filtered_dists.append(dist)
+                        filtered_metas.append(meta)
+                    if len(filtered_ids) >= top_k:
+                        break
+                if filtered_ids:
+                    fallback_mode = mode_name
+                    break
+            locally_filtered_hits = len(filtered_ids)
+            results = {
+                'ids': [filtered_ids],
+                'documents': [filtered_docs],
+                'distances': [filtered_dists],
+                'metadatas': [filtered_metas],
+            }
+
         chunks = []
+        unresolved_ids = []
         for doc_id, text, dist, meta in zip(
             results['ids'][0],
             results['documents'][0],
@@ -397,10 +616,54 @@ class CorpusIndex:
             results['metadatas'][0],
         ):
             # Find row index from chunk_id
-            row_idx = self._str_to_row.get(doc_id)
+            doc_id_str = str(doc_id)
+            row_idx = self._str_to_row.get(doc_id_str)
+            if row_idx is None and isinstance(meta, dict):
+                for key in ('chunk_id', 'id', 'doc_id'):
+                    meta_id = meta.get(key)
+                    if meta_id is not None:
+                        row_idx = self._str_to_row.get(str(meta_id))
+                        if row_idx is not None:
+                            break
+            if row_idx is None and text is not None:
+                candidate_rows = self._contextual_to_rows.get(str(text), [])
+                if len(candidate_rows) == 1:
+                    row_idx = candidate_rows[0]
+                elif candidate_rows:
+                    for candidate_idx in candidate_rows:
+                        candidate_meta = self.df.iloc[candidate_idx].get('metadata', {})
+                        if self._meta_matches_filters(
+                            candidate_meta,
+                            ticker=ticker,
+                            filing_year=filing_year,
+                            form_type=form_type,
+                        ):
+                            row_idx = candidate_idx
+                            break
+            if row_idx is None:
+                section_key = self._parse_section_style_id(doc_id_str)
+                if section_key is not None:
+                    candidate_rows = self._sectionkey_to_rows.get(section_key, [])
+                    if len(candidate_rows) == 1:
+                        row_idx = candidate_rows[0]
+                    elif candidate_rows:
+                        # Prefer the earliest chunk within the matched section.
+                        row_idx = min(candidate_rows, key=lambda i: int(self.df.iloc[i].get('metadata', {}).get('chunk_index', 0) or 0))
             if row_idx is not None:
                 chunk = self._chunk_from_row(row_idx, 1.0 - float(dist), 'dense')
                 chunks.append(chunk)
+            else:
+                unresolved_ids.append(doc_id_str)
+
+        debug_enabled = bool(CONFIG.get('dense_debug_logging', True))
+        if debug_enabled:
+            print(
+                "    [DenseDebug] "
+                f"query={query[:80]!r} where={where} "
+                f"filtered_hits={raw_filtered_hits} broad_hits={broad_hits} "
+                f"fallback_mode={fallback_mode} local_filtered_hits={locally_filtered_hits} returned={len(chunks)} "
+                f"unresolved_sample={unresolved_ids[:3]}"
+            )
         
         return chunks
 
